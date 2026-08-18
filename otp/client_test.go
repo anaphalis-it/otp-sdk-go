@@ -68,7 +68,9 @@ func server(t *testing.T, umurToken int) (*httptest.Server, *jejak) {
 		case r.URL.Path == "/v1/otp/verify":
 			fmt.Fprint(w, `{"transactionId":"otp_UJI","status":"VERIFIED","verifiedAt":"2026-08-18T08:57:00.000Z"}`)
 		case strings.HasSuffix(r.URL.Path, "/resend"):
-			fmt.Fprint(w, `{"ok":true}`)
+			fmt.Fprint(w, `{"transactionId":"otp_UJI","status":"SENT","channel":"SMS",`+
+				`"expiresAt":"2026-08-18T09:00:00.000Z","retriesRemaining":3,`+
+				`"resendAvailableAt":"2026-08-18T08:58:00.000Z"}`)
 		case strings.HasSuffix(r.URL.Path, "/cancel"):
 			fmt.Fprint(w, `{"transactionId":"otp_UJI","status":"CANCELLED"}`)
 		default:
@@ -139,7 +141,7 @@ func TestPostSelaluMembawaContentTypeDanBadan(t *testing.T) {
 	// tanpa badan, dan server menolaknya sebelum handler berjalan.
 	s, j := server(t, 900)
 	c := klien(t, s)
-	if err := c.Resend(context.Background(), "otp_UJI", ""); err != nil {
+	if _, err := c.Resend(context.Background(), "otp_UJI", ""); err != nil {
 		t.Fatalf("Resend: %v", err)
 	}
 	j.mu.Lock()
@@ -153,6 +155,47 @@ func TestPostSelaluMembawaContentTypeDanBadan(t *testing.T) {
 	}
 	if b := j.badan["/v1/otp/otp_UJI/resend"]; b != "{}" {
 		t.Fatalf("badan = %q, seharusnya {}", b)
+	}
+}
+
+func TestResendMengembalikanBadanResponse(t *testing.T) {
+	s, _ := server(t, 900)
+	c := klien(t, s)
+
+	// Nilai inilah yang dipakai aplikasi untuk menghitung mundur tombol
+	// "kirim ulang". Sebelumnya badan response dibuang dan client tidak punya
+	// cara mengetahuinya selain menebak.
+	hasil, err := c.Resend(context.Background(), "otp_UJI", "SMS")
+	if err != nil {
+		t.Fatalf("Resend: %v", err)
+	}
+	if hasil.ResendAvailableAt != "2026-08-18T08:58:00.000Z" {
+		t.Fatalf("ResendAvailableAt = %q", hasil.ResendAvailableAt)
+	}
+	if hasil.Channel != "SMS" {
+		t.Fatalf("Channel = %q, ingin SMS", hasil.Channel)
+	}
+	if hasil.RetriesRemaining != 3 {
+		t.Fatalf("RetriesRemaining = %d, ingin 3", hasil.RetriesRemaining)
+	}
+}
+
+func TestFlowIDIkutTerkirim(t *testing.T) {
+	s, j := server(t, 900)
+	c := klien(t, s)
+
+	if _, err := c.Request(context.Background(), RequestOptions{
+		MSISDN: "+628123456789", Purpose: "LOGIN", FlowID: "daftar-akun",
+	}); err != nil {
+		t.Fatalf("Request: %v", err)
+	}
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var in map[string]any
+	_ = json.Unmarshal([]byte(j.badan["/v1/otp/request"]), &in)
+	if in["flowId"] != "daftar-akun" {
+		t.Fatalf("flowId = %v, ingin daftar-akun", in["flowId"])
 	}
 }
 

@@ -2,11 +2,12 @@
 
 Client Go untuk Platform One Time Password PT Transportasi Jakarta.
 
-Membungkus REST API dan webhook status. Hanya memakai pustaka standar — tidak
-ada dependensi pihak ketiga. Membutuhkan Go 1.21 atau lebih baru.
+Membungkus REST API dan webhook status delivery. Hanya memakai standard
+library — tidak ada dependensi pihak ketiga. Membutuhkan Go 1.21 atau lebih
+baru.
 
 ```bash
-go get github.com/anaphalis-it/otp-sdk-go@v1.0.0
+go get github.com/anaphalis-it/otp-sdk-go@v1.1.0
 ```
 
 ## Penggunaan
@@ -23,12 +24,12 @@ if err != nil {
     return err
 }
 
-// Menerbitkan dan mengirim OTP.
+// Membuat kode OTP sekaligus mengirimkannya.
 t, err := c.Request(ctx, otp.RequestOptions{
     MSISDN: "+628123456789", Purpose: "LOGIN", Language: "id",
 })
 
-// Memvalidasi kode yang dimasukkan pengguna.
+// Memvalidasi kode yang diketik user.
 if _, err := c.Verify(ctx, t.TransactionID, "418293", "LOGIN"); err != nil {
     var oe *otp.Error
     if errors.As(err, &oe) && oe.Code == "OTP_LOCKED" {
@@ -38,28 +39,59 @@ if _, err := c.Verify(ctx, t.TransactionID, "418293", "LOGIN"); err != nil {
 }
 ```
 
-`NoDispatch: true` menerbitkan kode TANPA mengirim pesan — untuk pengujian
-yang tidak boleh menimbulkan biaya.
+`NoDispatch: true` membuat kode TANPA mengirim pesan — untuk testing yang tidak
+boleh menimbulkan biaya.
+
+`Client` aman dipakai dari banyak goroutine. Buat satu instance saat startup
+dan pakai ulang; membuat client baru per request ikut membuang connection pool
+dan cache token-nya.
 
 ## Method
 
 | Kegunaan | Method |
 | --- | --- |
-| Menyusun klien | `otp.NewClient(otp.Config{...})` |
-| Menerbitkan OTP | `c.Request(ctx, otp.RequestOptions{...})` |
-| Memvalidasi | `c.Verify(ctx, id, code, purpose)` |
-| Mengirim ulang | `c.Resend(ctx, id, channel)` |
-| Membatalkan | `c.Cancel(ctx, id)` |
+| Membuat client | `otp.NewClient(otp.Config{...})` |
+| Membuat + mengirim OTP | `c.Request(ctx, otp.RequestOptions{...})` |
+| Memvalidasi kode | `c.Verify(ctx, id, code, purpose)` |
+| Mengirim ulang kode yang sama | `c.Resend(ctx, id, channel)` |
+| Membatalkan transaksi | `c.Cancel(ctx, id)` |
 | Membaca status | `c.Status(ctx, id)` |
 
-Access token tidak perlu dipanggil sendiri. Klien menerbitkannya pada
-permintaan pertama dan menyegarkannya enam puluh detik sebelum berakhir; token
-yang tepat berakhir di tengah perjalanan sebuah permintaan menghasilkan 401
-yang tidak perlu. Permintaan yang datang bersamaan saat penyegaran berbagi
-satu pengambilan, sehingga sepuluh permintaan serentak tidak menerbitkan
-sepuluh token sekaligus.
+Access token tidak perlu diurus sendiri. Client mengambilnya pada pemanggilan
+pertama dan me-refresh 60 detik sebelum expired; token yang kebetulan expired
+di tengah request menghasilkan 401 yang sebenarnya bisa dihindari. Beberapa
+goroutine yang bersamaan menemukan cache kosong hanya memicu satu kali
+pengambilan.
 
-## Penerima webhook
+`Resend` mengirim ulang **kode yang sama** dan **tidak** memperpanjang masa
+berlaku. `ResendAvailableAt` pada hasilnya menyebutkan kapan resend berikutnya
+boleh dilakukan — pakai nilai itu untuk hitung mundur tombol "kirim ulang".
+
+`Cancel` dipakai saat user meninggalkan flow verifikasi. Tanpa cancel, kode itu
+tetap valid sampai expired.
+
+## Error
+
+Semua error dari platform bertipe `*otp.Error`. Field `Code` stabil dan aman
+dipakai untuk branching logic; `Message` bisa berubah sewaktu-waktu.
+
+```go
+var oe *otp.Error
+if errors.As(err, &oe) {
+    switch oe.Code {
+    case "OTP_RATE_LIMITED", "OTP_LOCKED", "OTP_RESEND_TOO_SOON":
+        if detik, ada := oe.RetryAfterSeconds(); ada {
+            // tunggu `detik` sebelum mencoba lagi
+        }
+    }
+}
+```
+
+`RetryAfterSeconds` dibaca langsung dari response, bukan dihitung dari
+timestamp absolut. Perhitungan semacam itu mengandalkan jam client sama dengan
+jam server, padahal jam mesin bisa meleset.
+
+## Webhook receiver
 
 ```go
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -81,46 +113,63 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-Tiga hal yang wajib diperhatikan penerima webhook:
+Tiga hal yang wajib diperhatikan receiver:
 
-**Tanda tangan dihitung atas badan MENTAH.** JSON yang diurai lalu dirakit
-ulang hampir pasti berbeda pada level byte, dan tanda tangannya tidak akan
-pernah cocok. Baca raw body sebelum body parser bekerja.
+**Kirim RAW BODY, bukan hasil parse.** JSON yang sudah di-parse lalu
+di-serialize ulang umumnya berbeda byte-nya, sehingga signature tidak akan
+pernah match. Ini kesalahan integrasi yang paling sering terjadi.
 
-**Pengiriman bersifat at-least-once dan urutannya tidak dijamin.** Pakai
-`e.Key()` sebagai kunci idempotensi, dan perlakukan status sebagai tingkatan
-yang tidak boleh mundur.
+**Endpoint wajib idempotent.** Delivery bersifat at-least-once dan urutannya
+tidak dijamin. Pakai `e.Key()` — gabungan `transactionId`, `status`, dan
+`attemptNo`.
 
-**Jawab cepat, proses di latar belakang.** Menahan response menyebabkan
-panggilan timeout dan di-retry tanpa keperluan.
+**Balas cepat, proses di background.** Kalau response ditahan sampai proses
+selesai, request-nya timeout dan platform akan retry padahal event-nya sudah
+diterima.
+
+`ParseWebhook` sendiri sudah menghitung HMAC dari raw body, menolak timestamp
+yang sudah lama untuk menahan replay attack, dan membandingkan signature dengan
+constant-time compare.
 
 ## Yang sengaja tidak dilakukan
 
-**Pustaka ini tidak mengulang permintaan secara diam-diam.** Pengulangan yang
-tidak terlihat pemanggil menyembunyikan kegagalan, dan pada endpoint yang
-mengirim pesan berbayar ia menggandakan biaya. Galat dikembalikan apa adanya
-berikut sisa waktu tunggunya lewat `RetryAfterSeconds()`, dan pemanggil yang
-memutuskan apakah dan kapan mengulang.
+**SDK ini tidak melakukan retry diam-diam.** Retry yang tidak terlihat client
+menyembunyikan kegagalan, dan pada endpoint yang mengirim pesan berbayar hal
+itu menggandakan biaya. Error dikembalikan apa adanya lengkap dengan sisa waktu
+tunggunya, dan client yang memutuskan apakah dan kapan melakukan retry.
 
-**Pustaka ini tidak menangani failover.** Perpindahan WhatsApp ke SMS
-dikerjakan platform, memakai kode yang sama pada transaksi yang sama.
-Memanggil `Request` untuk kedua kalinya justru menerbitkan transaksi baru
-dengan kode baru, dan pengguna menerima dua kode berbeda.
+**SDK ini tidak menangani failover.** Perpindahan WhatsApp ke SMS dikerjakan
+platform, memakai kode yang sama pada transaksi yang sama. Memanggil `Request`
+untuk kedua kalinya justru membuat transaksi baru dengan kode baru, dan user
+menerima dua kode berbeda.
 
-**Pustaka ini tidak menyimpan status transaksi.** Otoritasnya berada di
-server, dan salinan di sisi klien hanya akan menjadi sumber kebenaran kedua
-yang cepat atau lambat berbeda.
+**SDK ini tidak menyimpan status transaksi.** Otoritasnya ada di server, dan
+salinan di sisi client hanya akan menjadi sumber kebenaran kedua yang cepat
+atau lambat berbeda.
 
-## Pengujian
+## Testing
 
 ```bash
 go test ./...
 ```
 
-Tujuh belas pengujian, seluruhnya terhadap HTTP server sungguhan alih-alih
-transport tiruan — jaminan yang diuji bersifat perilaku antar permintaan, dan
-tiruan akan meloloskan tepat kesalahan yang ingin ditangkap. Tidak ada
-sambungan keluar. Lulus `go vet`, `gofmt`, dan `go test -race`.
+Sembilan belas test, seluruhnya terhadap HTTP server lokal alih-alih transport
+tiruan — jaminan yang diuji bersifat perilaku antar request, dan tiruan akan
+meloloskan tepat kesalahan yang ingin ditangkap. Tidak ada koneksi keluar.
+Lulus `go vet`, `gofmt`, dan `go test -race`.
+
+## Riwayat versi
+
+**v1.1.0**
+
+- `Resend` mengembalikan `*ResendResult`, sebelumnya hanya `error`.
+  `ResendAvailableAt` di dalamnya diperlukan untuk hitung mundur tombol kirim
+  ulang. **Memutus kompatibilitas terhadap v1.0.0.**
+- `RequestOptions.FlowID` ditambahkan.
+- `ToleransiDetik` menjadi `DefaultToleranceSeconds`, `VerifyWebhookDengan`
+  menjadi `VerifyWebhookAt`.
+
+**v1.0.0** — rilis pertama.
 
 ---
 

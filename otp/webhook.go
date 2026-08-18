@@ -12,10 +12,11 @@ import (
 	"time"
 )
 
-// ToleransiDetik adalah selisih waktu yang masih diterima pada webhook.
-const ToleransiDetik = 300
+// DefaultToleranceSeconds adalah selisih waktu maksimum antara timestamp
+// webhook dan waktu sekarang yang masih diterima.
+const DefaultToleranceSeconds = 300
 
-// Event adalah muatan webhook status.
+// Event adalah payload webhook status delivery.
 type Event struct {
 	Event             string            `json:"event"`
 	TransactionID     string            `json:"transactionId"`
@@ -31,27 +32,27 @@ type Event struct {
 	ProviderCode      string            `json:"providerCode"`
 }
 
-// Key adalah kunci idempotensi untuk satu peristiwa.
+// Key adalah idempotency key untuk satu event.
 //
-// Pengiriman bersifat at-least-once: satu peristiwa dapat tiba lebih dari
-// sekali, dan urutannya tidak dijamin. Simpan kunci ini dan abaikan yang sudah
-// pernah diproses.
+// Delivery bersifat at-least-once — satu event bisa datang lebih dari sekali,
+// dan urutannya tidak dijamin. Simpan key ini, lalu skip event yang key-nya
+// sudah pernah diproses.
 func (e Event) Key() string {
 	return fmt.Sprintf("%s:%s:%d", e.TransactionID, e.Status, e.AttemptNo)
 }
 
-// VerifyWebhook memeriksa tanda tangan satu panggilan webhook.
+// VerifyWebhook memeriksa signature satu request webhook.
 //
-// rawBody WAJIB berupa badan mentah, persis seperti yang diterima. JSON yang
-// diurai lalu dirakit ulang hampir pasti berbeda pada level byte, dan tanda
-// tangannya tidak akan pernah cocok.
+// rawBody WAJIB berupa RAW BODY, persis seperti yang diterima. JSON yang sudah
+// di-parse lalu di-serialize ulang umumnya berbeda byte-nya, sehingga
+// signature tidak akan pernah match.
 func VerifyWebhook(secret, timestamp, signature string, rawBody []byte) bool {
-	return verifyWebhookPada(secret, timestamp, signature, rawBody, time.Now(), ToleransiDetik)
+	return verifyWebhookPada(secret, timestamp, signature, rawBody, time.Now(), DefaultToleranceSeconds)
 }
 
-// VerifyWebhookDengan sama dengan VerifyWebhook, dengan toleransi dan acuan
-// waktu yang dapat ditentukan. Dipakai pengujian.
-func VerifyWebhookDengan(secret, timestamp, signature string, rawBody []byte,
+// VerifyWebhookAt sama dengan VerifyWebhook, tetapi acuan waktu dan toleransinya
+// ditentukan sendiri. Berguna untuk menulis test di sisi receiver.
+func VerifyWebhookAt(secret, timestamp, signature string, rawBody []byte,
 	sekarang time.Time, toleransiDetik int) bool {
 	return verifyWebhookPada(secret, timestamp, signature, rawBody, sekarang, toleransiDetik)
 }
@@ -66,8 +67,9 @@ func verifyWebhookPada(secret, timestamp, signature string, rawBody []byte,
 	if err != nil {
 		return false
 	}
-	// Timestamp ikut ditandatangani, bukan sekadar dikirim: tanpa pemeriksaan
-	// umur, panggilan sah yang direkam pihak lain dapat diputar ulang kapan pun.
+	// Timestamp ikut masuk ke perhitungan signature, bukan sekadar dikirim.
+	// Tanpa pengecekan umur, request lama yang direkam pihak lain bisa dikirim
+	// ulang kapan saja dan tetap lolos — replay attack.
 	if math.Abs(float64(sekarang.Unix()-detik)) > float64(toleransiDetik) {
 		return false
 	}
@@ -79,25 +81,27 @@ func verifyWebhookPada(secret, timestamp, signature string, rawBody []byte,
 	diharap := hex.EncodeToString(mac.Sum(nil))
 
 	diterima := strings.TrimPrefix(signature, "sha256=")
-	// hmac.Equal membandingkan dengan waktu tetap: perbandingan biasa
-	// membocorkan tanda tangan yang benar sedikit demi sedikit lewat selisih
-	// waktu tanggap.
+	// hmac.Equal adalah constant-time compare. Perbandingan string biasa
+	// berhenti di karakter pertama yang beda, dan selisih waktunya bisa dipakai
+	// menebak signature yang benar karakter demi karakter.
 	return hmac.Equal([]byte(diharap), []byte(diterima))
 }
 
-// ParseWebhook memverifikasi lalu mengurai satu panggilan webhook.
+// ParseWebhook memverifikasi signature lalu mem-parse satu request webhook.
+// Mengembalikan *Error dengan Code WEBHOOK_SIGNATURE_INVALID bila signature-nya
+// tidak sah, sudah kedaluwarsa, atau body-nya berubah.
 func ParseWebhook(secret, timestamp, signature string, rawBody []byte) (*Event, error) {
 	if !VerifyWebhook(secret, timestamp, signature, rawBody) {
 		return nil, &Error{
 			Code:       "WEBHOOK_SIGNATURE_INVALID",
-			Message:    "tanda tangan webhook tidak sah, kedaluwarsa, atau badannya sudah berubah",
+			Message:    "signature webhook tidak sah, sudah kedaluwarsa, atau body-nya berubah",
 			HTTPStatus: 401,
 			Details:    map[string]any{},
 		}
 	}
 	var e Event
 	if err := json.Unmarshal(rawBody, &e); err != nil {
-		return nil, fmt.Errorf("otp: muatan webhook tidak dapat diurai: %w", err)
+		return nil, fmt.Errorf("otp: payload webhook tidak dapat di-parse: %w", err)
 	}
 	return &e, nil
 }

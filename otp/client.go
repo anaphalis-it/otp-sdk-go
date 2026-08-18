@@ -1,16 +1,17 @@
-// Package otp adalah SDK tipis untuk Platform OTP Transjakarta.
+// Package otp adalah SDK untuk Platform OTP Transjakarta.
 //
-// Tipis dengan sengaja. Yang dibungkus hanya hal-hal yang, bila diserahkan ke
-// setiap pemanggil, akan ditulis ulang berbeda-beda dan salah di tempat yang
-// sama: pengelolaan access token, bentuk galat yang dapat dicabangkan, dan
-// verifikasi tanda tangan webhook.
+// SDK ini sengaja dibuat tipis. Yang dibungkus hanya tiga hal yang, bila
+// diserahkan ke setiap client, akan ditulis ulang berbeda-beda dan keliru di
+// tempat yang sama: manajemen access token, mapping error yang bisa dipakai
+// untuk branching logic, dan verifikasi signature webhook.
 //
-// Yang TIDAK dilakukan pustaka ini, juga dengan sengaja: ia tidak mengulang
-// permintaan secara diam-diam. Pengulangan yang tidak terlihat pemanggil
-// menyembunyikan kegagalan dan, pada endpoint yang mengirim pesan berbayar,
-// menggandakan biaya. Galatnya dikembalikan apa adanya berikut RetryAfterSeconds.
+// Yang sengaja TIDAK dilakukan: SDK ini tidak melakukan retry diam-diam. Retry
+// yang tidak terlihat client menyembunyikan kegagalan, dan pada endpoint yang
+// mengirim pesan berbayar hal itu menggandakan biaya. Error dikembalikan apa
+// adanya, lengkap dengan RetryAfterSeconds, dan client yang memutuskan apakah
+// dan kapan melakukan retry.
 //
-// Hanya memakai pustaka standar.
+// Hanya memakai standard library.
 package otp
 
 import (
@@ -28,7 +29,8 @@ import (
 
 const scopeBawaan = "otp:request otp:verify otp:read"
 
-// Error adalah galat dari API. Code stabil dan aman dijadikan dasar percabangan.
+// Error adalah error response dari API. Field Code stabil dan aman dipakai
+// untuk branching logic; Message bisa berubah sewaktu-waktu.
 type Error struct {
 	Code       string
 	Message    string
@@ -41,12 +43,12 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("otp: %s (%d): %s", e.Code, e.HTTPStatus, e.Message)
 }
 
-// RetryAfterSeconds mengembalikan sisa waktu tunggu, dan false bila galatnya
-// tidak berbatas waktu.
+// RetryAfterSeconds mengembalikan sisa waktu tunggu dalam detik, dan false
+// bila error ini tidak punya batas waktu.
 //
-// Diambil dari Details, bukan dihitung dari lockedUntil: menghitung selisih
-// dari waktu absolut menuntut jam pemanggil sepakat dengan jam server, dan jam
-// mesin dapat meleset.
+// Nilainya dibaca dari Details, bukan dihitung dari lockedUntil. Perhitungan
+// dari timestamp absolut mengandalkan jam client sama dengan jam server,
+// padahal jam mesin bisa meleset.
 func (e *Error) RetryAfterSeconds() (int, bool) {
 	v, ada := e.Details["retryAfterSeconds"]
 	if !ada {
@@ -59,7 +61,7 @@ func (e *Error) RetryAfterSeconds() (int, bool) {
 	return int(f), true
 }
 
-// Config menyusun Client.
+// Config adalah konfigurasi Client.
 type Config struct {
 	BaseURL      string // misal https://otp.transjakarta.co.id
 	ClientID     string
@@ -69,7 +71,8 @@ type Config struct {
 	HTTPClient   *http.Client  // kosong berarti klien baru dengan Timeout di atas
 }
 
-// Client memanggil Platform OTP.
+// Client adalah HTTP client untuk Platform OTP. Aman dipakai dari banyak
+// goroutine secara bersamaan.
 type Client struct {
 	baseURL string
 	id      string
@@ -82,7 +85,8 @@ type Client struct {
 	berlaku time.Time
 }
 
-// NewClient menyusun Client. Galat bila konfigurasinya kurang.
+// NewClient membuat Client baru. Mengembalikan error bila konfigurasinya
+// tidak lengkap.
 func NewClient(c Config) (*Client, error) {
 	if c.BaseURL == "" {
 		return nil, fmt.Errorf("otp: BaseURL wajib diisi")
@@ -111,20 +115,22 @@ func NewClient(c Config) (*Client, error) {
 	}, nil
 }
 
-// RequestOptions adalah masukan penerbitan OTP.
+// RequestOptions adalah input untuk membuat OTP.
 type RequestOptions struct {
 	MSISDN            string
 	Purpose           string
 	Language          string // "id" atau "en"; kosong berarti bawaan aplikasi
 	ChannelPreference string // "WHATSAPP" atau "SMS"
-	// NoDispatch menerbitkan kode TANPA mengirim pesan. Untuk pengujian.
+	// NoDispatch membuat kode TANPA mengirim pesan. Untuk testing yang tidak
+	// boleh menimbulkan biaya.
 	NoDispatch     bool
 	Metadata       map[string]string
+	FlowID         string
 	EndUserIP      string
 	IdempotencyKey string
 }
 
-// RequestResult adalah jawaban penerbitan. Kode OTP tidak pernah disertakan.
+// RequestResult adalah response dari Request. Kode OTP tidak pernah disertakan.
 type RequestResult struct {
 	TransactionID     string `json:"transactionId"`
 	Status            string `json:"status"`
@@ -134,20 +140,30 @@ type RequestResult struct {
 	ResendAvailableAt string `json:"resendAvailableAt"`
 }
 
-// VerifyResult adalah jawaban verifikasi yang berhasil.
+// VerifyResult adalah response dari Verify yang berhasil.
 type VerifyResult struct {
 	TransactionID string `json:"transactionId"`
 	Status        string `json:"status"`
 	VerifiedAt    string `json:"verifiedAt"`
 }
 
-// CancelResult adalah jawaban pembatalan transaksi.
+// CancelResult adalah response dari Cancel.
 type CancelResult struct {
 	TransactionID string `json:"transactionId"`
 	Status        string `json:"status"`
 }
 
-// StatusResult adalah jawaban pembacaan status.
+// ResendResult adalah response dari Resend.
+type ResendResult struct {
+	TransactionID     string `json:"transactionId"`
+	Status            string `json:"status"`
+	Channel           string `json:"channel"`
+	ExpiresAt         string `json:"expiresAt"`
+	RetriesRemaining  int    `json:"retriesRemaining"`
+	ResendAvailableAt string `json:"resendAvailableAt"`
+}
+
+// StatusResult adalah response dari Status.
 type StatusResult struct {
 	TransactionID    string `json:"transactionId"`
 	Status           string `json:"status"`
@@ -156,16 +172,18 @@ type StatusResult struct {
 	ExpiresAt        string `json:"expiresAt"`
 }
 
-// Token mengembalikan access token yang masih berlaku, mengambil ulang bila perlu.
+// Token mengembalikan access token yang masih berlaku, dan mengambil token
+// baru bila perlu. Tidak perlu dipanggil manual — semua method lain sudah
+// memanggilnya sendiri.
 func (c *Client) Token(ctx context.Context) (string, error) {
-	// Kunci dipegang selama pengambilan, bukan hanya saat membaca cache.
+	// Lock dipegang selama pengambilan token, bukan hanya saat membaca cache.
 	// Tanpa itu, sepuluh goroutine yang bersamaan menemukan cache kosong akan
-	// menerbitkan sepuluh token sekaligus.
+	// mengambil sepuluh token sekaligus.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Disegarkan 60 detik SEBELUM kedaluwarsa. Token yang tepat habis di tengah
-	// perjalanan permintaan menghasilkan 401 yang tidak perlu.
+	// Di-refresh 60 detik SEBELUM expired. Token yang kebetulan expired di
+	// tengah request menghasilkan 401 yang sebenarnya bisa dihindari.
 	if c.token != "" && time.Now().Before(c.berlaku.Add(-60*time.Second)) {
 		return c.token, nil
 	}
@@ -192,7 +210,7 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 	return c.token, nil
 }
 
-// Request menerbitkan dan mengirim OTP.
+// Request membuat kode OTP sekaligus mengirimkannya.
 func (c *Client) Request(ctx context.Context, o RequestOptions) (*RequestResult, error) {
 	if o.MSISDN == "" || o.Purpose == "" {
 		return nil, fmt.Errorf("otp: MSISDN dan Purpose wajib diisi")
@@ -210,6 +228,9 @@ func (c *Client) Request(ctx context.Context, o RequestOptions) (*RequestResult,
 	if len(o.Metadata) > 0 {
 		badan["metadata"] = o.Metadata
 	}
+	if o.FlowID != "" {
+		badan["flowId"] = o.FlowID
+	}
 	if o.EndUserIP != "" {
 		badan["endUserIp"] = o.EndUserIP
 	}
@@ -224,7 +245,7 @@ func (c *Client) Request(ctx context.Context, o RequestOptions) (*RequestResult,
 	return &hasil, nil
 }
 
-// Verify memvalidasi kode yang dimasukkan pengguna.
+// Verify memvalidasi kode yang dimasukkan user.
 func (c *Client) Verify(ctx context.Context, transactionID, code, purpose string) (*VerifyResult, error) {
 	if transactionID == "" {
 		return nil, fmt.Errorf("otp: transactionID wajib diisi")
@@ -237,23 +258,36 @@ func (c *Client) Verify(ctx context.Context, transactionID, code, purpose string
 	return &hasil, nil
 }
 
-// Resend mengirim ulang KODE YANG SAMA. Masa berlakunya tidak diperpanjang.
-func (c *Client) Resend(ctx context.Context, transactionID, channel string) error {
+// Resend mengirim ulang KODE YANG SAMA pada transaksi yang sama. Masa
+// berlakunya TIDAK diperpanjang, sehingga kode yang sudah expired tidak bisa
+// di-resend — yang dibutuhkan adalah Request baru.
+//
+// Parameter channel opsional. Diisi "SMS" atau "WHATSAPP" untuk mengirim ulang
+// lewat channel yang berbeda dari pengiriman pertama; kosongkan untuk memakai
+// channel yang sama.
+//
+// ResendAvailableAt pada hasilnya menyebutkan kapan resend berikutnya boleh
+// dilakukan.
+func (c *Client) Resend(ctx context.Context, transactionID, channel string) (*ResendResult, error) {
 	if transactionID == "" {
-		return fmt.Errorf("otp: transactionID wajib diisi")
+		return nil, fmt.Errorf("otp: transactionID wajib diisi")
 	}
 	badan := map[string]any{}
 	if channel != "" {
 		badan["channel"] = channel
 	}
-	return c.kirim(ctx, http.MethodPost,
-		"/v1/otp/"+url.PathEscape(transactionID)+"/resend", badan, nil, nil, false)
+	var hasil ResendResult
+	if err := c.kirim(ctx, http.MethodPost,
+		"/v1/otp/"+url.PathEscape(transactionID)+"/resend", badan, nil, &hasil, false); err != nil {
+		return nil, err
+	}
+	return &hasil, nil
 }
 
-// Cancel membatalkan transaksi sehingga kodenya tidak dapat lagi diverifikasi.
+// Cancel membatalkan transaksi sehingga kodenya tidak bisa diverifikasi lagi.
 //
-// Berguna saat pengguna meninggalkan alur verifikasi: tanpa pembatalan, kode
-// yang ditinggalkan tetap berlaku sampai masa berlakunya habis.
+// Dipakai saat user meninggalkan flow verifikasi. Tanpa cancel, kode itu tetap
+// valid sampai expired.
 func (c *Client) Cancel(ctx context.Context, transactionID string) (*CancelResult, error) {
 	if transactionID == "" {
 		return nil, fmt.Errorf("otp: transactionID wajib diisi")
@@ -284,22 +318,22 @@ func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
 
 	var isi io.Reader
 	if metode != http.MethodGet {
-		// Badan "{}" tetap dikirim meski kosong. Sebagian proxy menyisipkan
-		// application/x-www-form-urlencoded pada POST tanpa badan, dan server
-		// menolaknya sebelum handler berjalan.
+		// Body "{}" tetap dikirim meski kosong. Sebagian proxy menyisipkan
+		// application/x-www-form-urlencoded pada POST tanpa body, dan server
+		// menolaknya dengan 415 sebelum handler jalan.
 		if badan == nil {
 			badan = map[string]any{}
 		}
 		b, err := json.Marshal(badan)
 		if err != nil {
-			return fmt.Errorf("otp: gagal menyusun badan permintaan: %w", err)
+			return fmt.Errorf("otp: gagal menyusun request body: %w", err)
 		}
 		isi = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, metode, c.baseURL+jalur, isi)
 	if err != nil {
-		return fmt.Errorf("otp: gagal menyusun permintaan: %w", err)
+		return fmt.Errorf("otp: gagal menyusun request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	if metode != http.MethodGet {
@@ -324,7 +358,7 @@ func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
 	}
 	defer res.Body.Close()
 
-	// Dibatasi supaya jawaban yang tidak terduga besarnya tidak menghabiskan memori.
+	// Dibatasi supaya response yang ukurannya tidak terduga tidak menghabiskan memori.
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 
 	if res.StatusCode < 200 || res.StatusCode > 299 {
@@ -343,7 +377,7 @@ func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
 		}
 		pesan := bungkus.Error.Message
 		if pesan == "" {
-			pesan = fmt.Sprintf("platform OTP menjawab %d", res.StatusCode)
+			pesan = fmt.Sprintf("platform OTP membalas HTTP %d", res.StatusCode)
 		}
 		rincian := bungkus.Error.Details
 		if rincian == nil {
@@ -355,7 +389,7 @@ func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
 
 	if keluar != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, keluar); err != nil {
-			return fmt.Errorf("otp: jawaban tidak dapat diurai: %w", err)
+			return fmt.Errorf("otp: response tidak dapat di-parse: %w", err)
 		}
 	}
 	return nil
