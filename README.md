@@ -7,7 +7,7 @@ library — tidak ada dependensi pihak ketiga. Membutuhkan Go 1.21 atau lebih
 baru.
 
 ```bash
-go get github.com/anaphalis-it/otp-sdk-go@v1.1.0
+go get github.com/anaphalis-it/otp-sdk-go@v1.1.1
 ```
 
 ## Penggunaan
@@ -159,6 +159,9 @@ meloloskan tepat kesalahan yang ingin ditangkap. Tidak ada koneksi keluar.
 Lulus `go vet`, `gofmt`, dan `go test -race`.
 
 ## Riwayat versi
+
+**v1.1.1** — Identifier internal dan nama test diseragamkan ke bahasa Inggris.
+Tidak ada perubahan pada API publik maupun perilaku.
 
 **v1.1.0**
 

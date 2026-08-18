@@ -47,30 +47,30 @@ func (e Event) Key() string {
 // di-parse lalu di-serialize ulang umumnya berbeda byte-nya, sehingga
 // signature tidak akan pernah match.
 func VerifyWebhook(secret, timestamp, signature string, rawBody []byte) bool {
-	return verifyWebhookPada(secret, timestamp, signature, rawBody, time.Now(), DefaultToleranceSeconds)
+	return verifyWebhookAtTime(secret, timestamp, signature, rawBody, time.Now(), DefaultToleranceSeconds)
 }
 
 // VerifyWebhookAt sama dengan VerifyWebhook, tetapi acuan waktu dan toleransinya
 // ditentukan sendiri. Berguna untuk menulis test di sisi receiver.
 func VerifyWebhookAt(secret, timestamp, signature string, rawBody []byte,
-	sekarang time.Time, toleransiDetik int) bool {
-	return verifyWebhookPada(secret, timestamp, signature, rawBody, sekarang, toleransiDetik)
+	now time.Time, toleranceSeconds int) bool {
+	return verifyWebhookAtTime(secret, timestamp, signature, rawBody, now, toleranceSeconds)
 }
 
-func verifyWebhookPada(secret, timestamp, signature string, rawBody []byte,
-	sekarang time.Time, toleransiDetik int) bool {
+func verifyWebhookAtTime(secret, timestamp, signature string, rawBody []byte,
+	now time.Time, toleranceSeconds int) bool {
 
 	if secret == "" || timestamp == "" || signature == "" {
 		return false
 	}
-	detik, err := strconv.ParseInt(timestamp, 10, 64)
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil {
 		return false
 	}
 	// Timestamp ikut masuk ke perhitungan signature, bukan sekadar dikirim.
 	// Tanpa pengecekan umur, request lama yang direkam pihak lain bisa dikirim
 	// ulang kapan saja dan tetap lolos — replay attack.
-	if math.Abs(float64(sekarang.Unix()-detik)) > float64(toleransiDetik) {
+	if math.Abs(float64(now.Unix()-ts)) > float64(toleranceSeconds) {
 		return false
 	}
 
@@ -78,13 +78,13 @@ func verifyWebhookPada(secret, timestamp, signature string, rawBody []byte,
 	mac.Write([]byte(timestamp))
 	mac.Write([]byte("."))
 	mac.Write(rawBody)
-	diharap := hex.EncodeToString(mac.Sum(nil))
+	expected := hex.EncodeToString(mac.Sum(nil))
 
-	diterima := strings.TrimPrefix(signature, "sha256=")
+	received := strings.TrimPrefix(signature, "sha256=")
 	// hmac.Equal adalah constant-time compare. Perbandingan string biasa
 	// berhenti di karakter pertama yang beda, dan selisih waktunya bisa dipakai
 	// menebak signature yang benar karakter demi karakter.
-	return hmac.Equal([]byte(diharap), []byte(diterima))
+	return hmac.Equal([]byte(expected), []byte(received))
 }
 
 // ParseWebhook memverifikasi signature lalu mem-parse satu request webhook.

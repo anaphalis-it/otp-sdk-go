@@ -27,7 +27,7 @@ import (
 	"time"
 )
 
-const scopeBawaan = "otp:request otp:verify otp:read"
+const defaultScope = "otp:request otp:verify otp:read"
 
 // Error adalah error response dari API. Field Code stabil dan aman dipakai
 // untuk branching logic; Message bisa berubah sewaktu-waktu.
@@ -50,8 +50,8 @@ func (e *Error) Error() string {
 // dari timestamp absolut mengandalkan jam client sama dengan jam server,
 // padahal jam mesin bisa meleset.
 func (e *Error) RetryAfterSeconds() (int, bool) {
-	v, ada := e.Details["retryAfterSeconds"]
-	if !ada {
+	v, ok := e.Details["retryAfterSeconds"]
+	if !ok {
 		return 0, false
 	}
 	f, ok := v.(float64) // encoding/json membaca seluruh angka sebagai float64
@@ -80,9 +80,9 @@ type Client struct {
 	scope   string
 	hc      *http.Client
 
-	mu      sync.Mutex
-	token   string
-	berlaku time.Time
+	mu        sync.Mutex
+	token     string
+	expiresAt time.Time
 }
 
 // NewClient membuat Client baru. Mengembalikan error bila konfigurasinya
@@ -94,17 +94,17 @@ func NewClient(c Config) (*Client, error) {
 	if c.ClientID == "" || c.ClientSecret == "" {
 		return nil, fmt.Errorf("otp: ClientID dan ClientSecret wajib diisi")
 	}
-	tenggat := c.Timeout
-	if tenggat == 0 {
-		tenggat = 10 * time.Second
+	timeout := c.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
 	}
 	hc := c.HTTPClient
 	if hc == nil {
-		hc = &http.Client{Timeout: tenggat}
+		hc = &http.Client{Timeout: timeout}
 	}
 	scope := c.Scope
 	if scope == "" {
-		scope = scopeBawaan
+		scope = defaultScope
 	}
 	return &Client{
 		baseURL: strings.TrimRight(c.BaseURL, "/"),
@@ -184,29 +184,29 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 
 	// Di-refresh 60 detik SEBELUM expired. Token yang kebetulan expired di
 	// tengah request menghasilkan 401 yang sebenarnya bisa dihindari.
-	if c.token != "" && time.Now().Before(c.berlaku.Add(-60*time.Second)) {
+	if c.token != "" && time.Now().Before(c.expiresAt.Add(-60*time.Second)) {
 		return c.token, nil
 	}
 
-	badan := map[string]string{
+	body := map[string]string{
 		"grant_type":    "client_credentials",
 		"client_id":     c.id,
 		"client_secret": c.secret,
 		"scope":         c.scope,
 	}
-	var jawab struct {
+	var tokenResp struct {
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int    `json:"expires_in"`
 	}
-	if err := c.kirim(ctx, http.MethodPost, "/v1/oauth/token", badan, nil, &jawab, true); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v1/oauth/token", body, nil, &tokenResp, true); err != nil {
 		return "", err
 	}
-	umur := jawab.ExpiresIn
-	if umur == 0 {
-		umur = 900
+	ttl := tokenResp.ExpiresIn
+	if ttl == 0 {
+		ttl = 900
 	}
-	c.token = jawab.AccessToken
-	c.berlaku = time.Now().Add(time.Duration(umur) * time.Second)
+	c.token = tokenResp.AccessToken
+	c.expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
 	return c.token, nil
 }
 
@@ -215,34 +215,34 @@ func (c *Client) Request(ctx context.Context, o RequestOptions) (*RequestResult,
 	if o.MSISDN == "" || o.Purpose == "" {
 		return nil, fmt.Errorf("otp: MSISDN dan Purpose wajib diisi")
 	}
-	badan := map[string]any{"msisdn": o.MSISDN, "purpose": o.Purpose}
+	body := map[string]any{"msisdn": o.MSISDN, "purpose": o.Purpose}
 	if o.Language != "" {
-		badan["language"] = o.Language
+		body["language"] = o.Language
 	}
 	if o.ChannelPreference != "" {
-		badan["channelPreference"] = o.ChannelPreference
+		body["channelPreference"] = o.ChannelPreference
 	}
 	if o.NoDispatch {
-		badan["dispatch"] = false
+		body["dispatch"] = false
 	}
 	if len(o.Metadata) > 0 {
-		badan["metadata"] = o.Metadata
+		body["metadata"] = o.Metadata
 	}
 	if o.FlowID != "" {
-		badan["flowId"] = o.FlowID
+		body["flowId"] = o.FlowID
 	}
 	if o.EndUserIP != "" {
-		badan["endUserIp"] = o.EndUserIP
+		body["endUserIp"] = o.EndUserIP
 	}
 	var header map[string]string
 	if o.IdempotencyKey != "" {
 		header = map[string]string{"x-idempotency-key": o.IdempotencyKey}
 	}
-	var hasil RequestResult
-	if err := c.kirim(ctx, http.MethodPost, "/v1/otp/request", badan, header, &hasil, false); err != nil {
+	var out RequestResult
+	if err := c.do(ctx, http.MethodPost, "/v1/otp/request", body, header, &out, false); err != nil {
 		return nil, err
 	}
-	return &hasil, nil
+	return &out, nil
 }
 
 // Verify memvalidasi kode yang dimasukkan user.
@@ -250,12 +250,12 @@ func (c *Client) Verify(ctx context.Context, transactionID, code, purpose string
 	if transactionID == "" {
 		return nil, fmt.Errorf("otp: transactionID wajib diisi")
 	}
-	badan := map[string]any{"transactionId": transactionID, "code": code, "purpose": purpose}
-	var hasil VerifyResult
-	if err := c.kirim(ctx, http.MethodPost, "/v1/otp/verify", badan, nil, &hasil, false); err != nil {
+	body := map[string]any{"transactionId": transactionID, "code": code, "purpose": purpose}
+	var out VerifyResult
+	if err := c.do(ctx, http.MethodPost, "/v1/otp/verify", body, nil, &out, false); err != nil {
 		return nil, err
 	}
-	return &hasil, nil
+	return &out, nil
 }
 
 // Resend mengirim ulang KODE YANG SAMA pada transaksi yang sama. Masa
@@ -272,16 +272,16 @@ func (c *Client) Resend(ctx context.Context, transactionID, channel string) (*Re
 	if transactionID == "" {
 		return nil, fmt.Errorf("otp: transactionID wajib diisi")
 	}
-	badan := map[string]any{}
+	body := map[string]any{}
 	if channel != "" {
-		badan["channel"] = channel
+		body["channel"] = channel
 	}
-	var hasil ResendResult
-	if err := c.kirim(ctx, http.MethodPost,
-		"/v1/otp/"+url.PathEscape(transactionID)+"/resend", badan, nil, &hasil, false); err != nil {
+	var out ResendResult
+	if err := c.do(ctx, http.MethodPost,
+		"/v1/otp/"+url.PathEscape(transactionID)+"/resend", body, nil, &out, false); err != nil {
 		return nil, err
 	}
-	return &hasil, nil
+	return &out, nil
 }
 
 // Cancel membatalkan transaksi sehingga kodenya tidak bisa diverifikasi lagi.
@@ -292,12 +292,12 @@ func (c *Client) Cancel(ctx context.Context, transactionID string) (*CancelResul
 	if transactionID == "" {
 		return nil, fmt.Errorf("otp: transactionID wajib diisi")
 	}
-	var hasil CancelResult
-	if err := c.kirim(ctx, http.MethodPost,
-		"/v1/otp/"+url.PathEscape(transactionID)+"/cancel", nil, nil, &hasil, false); err != nil {
+	var out CancelResult
+	if err := c.do(ctx, http.MethodPost,
+		"/v1/otp/"+url.PathEscape(transactionID)+"/cancel", nil, nil, &out, false); err != nil {
 		return nil, err
 	}
-	return &hasil, nil
+	return &out, nil
 }
 
 // Status membaca status transaksi. Kode OTP tidak pernah disertakan.
@@ -305,44 +305,44 @@ func (c *Client) Status(ctx context.Context, transactionID string) (*StatusResul
 	if transactionID == "" {
 		return nil, fmt.Errorf("otp: transactionID wajib diisi")
 	}
-	var hasil StatusResult
-	if err := c.kirim(ctx, http.MethodGet,
-		"/v1/otp/"+url.PathEscape(transactionID), nil, nil, &hasil, false); err != nil {
+	var out StatusResult
+	if err := c.do(ctx, http.MethodGet,
+		"/v1/otp/"+url.PathEscape(transactionID), nil, nil, &out, false); err != nil {
 		return nil, err
 	}
-	return &hasil, nil
+	return &out, nil
 }
 
-func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
-	header map[string]string, keluar any, tanpaToken bool) error {
+func (c *Client) do(ctx context.Context, method, path string, body any,
+	header map[string]string, out any, skipAuth bool) error {
 
-	var isi io.Reader
-	if metode != http.MethodGet {
+	var reader io.Reader
+	if method != http.MethodGet {
 		// Body "{}" tetap dikirim meski kosong. Sebagian proxy menyisipkan
 		// application/x-www-form-urlencoded pada POST tanpa body, dan server
 		// menolaknya dengan 415 sebelum handler jalan.
-		if badan == nil {
-			badan = map[string]any{}
+		if body == nil {
+			body = map[string]any{}
 		}
-		b, err := json.Marshal(badan)
+		b, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("otp: gagal menyusun request body: %w", err)
 		}
-		isi = bytes.NewReader(b)
+		reader = bytes.NewReader(b)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, metode, c.baseURL+jalur, isi)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
 		return fmt.Errorf("otp: gagal menyusun request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	if metode != http.MethodGet {
+	if method != http.MethodGet {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range header {
 		req.Header.Set(k, v)
 	}
-	if !tanpaToken {
+	if !skipAuth {
 		tok, err := c.Token(ctx)
 		if err != nil {
 			return err
@@ -362,7 +362,7 @@ func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
 	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 
 	if res.StatusCode < 200 || res.StatusCode > 299 {
-		var bungkus struct {
+		var envelope struct {
 			Error struct {
 				Code      string         `json:"code"`
 				Message   string         `json:"message"`
@@ -370,25 +370,25 @@ func (c *Client) kirim(ctx context.Context, metode, jalur string, badan any,
 				Details   map[string]any `json:"details"`
 			} `json:"error"`
 		}
-		_ = json.Unmarshal(raw, &bungkus)
-		kode := bungkus.Error.Code
-		if kode == "" {
-			kode = fmt.Sprintf("HTTP_%d", res.StatusCode)
+		_ = json.Unmarshal(raw, &envelope)
+		code := envelope.Error.Code
+		if code == "" {
+			code = fmt.Sprintf("HTTP_%d", res.StatusCode)
 		}
-		pesan := bungkus.Error.Message
-		if pesan == "" {
-			pesan = fmt.Sprintf("platform OTP membalas HTTP %d", res.StatusCode)
+		message := envelope.Error.Message
+		if message == "" {
+			message = fmt.Sprintf("platform OTP membalas HTTP %d", res.StatusCode)
 		}
-		rincian := bungkus.Error.Details
-		if rincian == nil {
-			rincian = map[string]any{}
+		details := envelope.Error.Details
+		if details == nil {
+			details = map[string]any{}
 		}
-		return &Error{Code: kode, Message: pesan, HTTPStatus: res.StatusCode,
-			RequestID: bungkus.Error.RequestID, Details: rincian}
+		return &Error{Code: code, Message: message, HTTPStatus: res.StatusCode,
+			RequestID: envelope.Error.RequestID, Details: details}
 	}
 
-	if keluar != nil && len(raw) > 0 {
-		if err := json.Unmarshal(raw, keluar); err != nil {
+	if out != nil && len(raw) > 0 {
+		if err := json.Unmarshal(raw, out); err != nil {
 			return fmt.Errorf("otp: response tidak dapat di-parse: %w", err)
 		}
 	}
