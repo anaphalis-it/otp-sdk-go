@@ -7,7 +7,7 @@ library — tidak ada dependensi pihak ketiga. Membutuhkan Go 1.21 atau lebih
 baru.
 
 ```bash
-go get github.com/anaphalis-it/otp-sdk-go@v1.1.1
+go get github.com/anaphalis-it/otp-sdk-go@v1.2.0
 ```
 
 ## Penggunaan
@@ -62,6 +62,14 @@ pertama dan me-refresh 60 detik sebelum expired; token yang kebetulan expired
 di tengah request menghasilkan 401 yang sebenarnya bisa dihindari. Beberapa
 goroutine yang bersamaan menemukan cache kosong hanya memicu satu kali
 pengambilan.
+
+Bila token ternyata ditolak di tengah masa berlakunya — misalnya karena client
+secret dirotasi — client mengambil token baru lalu mengulang request itu **satu
+kali**. Pengulangan ini terbatas pada penolakan di lapisan authentication.
+`OTP_CODE_MISMATCH` juga berstatus 401 dan sengaja TIDAK pernah diulang, sebab
+setiap pengulangan akan memakan satu jatah percobaan verifikasi milik user.
+`scope_missing` juga dikecualikan, karena token baru tidak akan memberi scope
+yang memang tidak dimiliki credential-nya.
 
 `Resend` mengirim ulang **kode yang sama** dan **tidak** memperpanjang masa
 berlaku. `ResendAvailableAt` pada hasilnya menyebutkan kapan resend berikutnya
@@ -138,6 +146,11 @@ menyembunyikan kegagalan, dan pada endpoint yang mengirim pesan berbayar hal
 itu menggandakan biaya. Error dikembalikan apa adanya lengkap dengan sisa waktu
 tunggunya, dan client yang memutuskan apakah dan kapan melakukan retry.
 
+Satu-satunya pengecualian adalah pengulangan setelah re-auth di atas, dan itu
+aman justru karena request yang ditolak di lapisan authentication belum pernah
+menyentuh logic bisnis — tidak ada pesan yang terkirim dan tidak ada biaya yang
+timbul pada percobaan pertamanya.
+
 **SDK ini tidak menangani failover.** Perpindahan WhatsApp ke SMS dikerjakan
 platform, memakai kode yang sama pada transaksi yang sama. Memanggil `Request`
 untuk kedua kalinya justru membuat transaksi baru dengan kode baru, dan user
@@ -153,12 +166,16 @@ atau lambat berbeda.
 go test ./...
 ```
 
-Sembilan belas test, seluruhnya terhadap HTTP server lokal alih-alih transport
+Dua puluh empat test, seluruhnya terhadap HTTP server lokal alih-alih transport
 tiruan — jaminan yang diuji bersifat perilaku antar request, dan tiruan akan
 meloloskan tepat kesalahan yang ingin ditangkap. Tidak ada koneksi keluar.
 Lulus `go vet`, `gofmt`, dan `go test -race`.
 
 ## Riwayat versi
+
+**v1.2.0** — Token yang ditolak di tengah masa berlakunya memicu pengambilan
+token baru dan pengulangan request satu kali, terbatas pada penolakan di
+lapisan authentication. Tidak ada perubahan pada signature method mana pun.
 
 **v1.1.1** — Identifier internal dan nama test diseragamkan ke bahasa Inggris.
 Tidak ada perubahan pada API publik maupun perilaku.

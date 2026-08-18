@@ -82,6 +82,42 @@ func server(t *testing.T, tokenTTL int) (*httptest.Server, *trace) {
 	return s, j
 }
 
+// serverTolakSekali membalas 401 pada permintaan bisnis PERTAMA, lalu normal.
+// tolakSelalu membuat penolakannya tidak pernah berhenti, untuk membuktikan
+// pengulangan berhenti setelah satu kali.
+func serverTolakSekali(t *testing.T, kode, alasan string, tolakSelalu bool) (*httptest.Server, *trace) {
+	t.Helper()
+	j := &trace{last: map[string]*http.Request{}, body: map[string]string{},
+		count: map[string]int{}}
+	var bisnis int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		j.mu.Lock()
+		j.body[r.URL.Path] = string(b)
+		j.count[r.URL.Path]++
+		j.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/oauth/token" {
+			n := atomic.AddInt32(&j.token, 1)
+			fmt.Fprintf(w, `{"access_token":"tok-%d","expires_in":900}`, n)
+			return
+		}
+		if n := atomic.AddInt32(&bisnis, 1); n == 1 || tolakSelalu {
+			d := ""
+			if alasan != "" {
+				d = fmt.Sprintf(`,"details":{"reason":%q}`, alasan)
+			}
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":{"code":%q,"message":"ditolak"%s}}`, kode, d)
+			return
+		}
+		fmt.Fprint(w, `{"transactionId":"otp_UJI","status":"VERIFIED","verifiedAt":"2026-08-18T08:57:00.000Z"}`)
+	}))
+	t.Cleanup(s.Close)
+	return s, j
+}
+
 func newTestClient(t *testing.T, s *httptest.Server) *Client {
 	t.Helper()
 	c, err := NewClient(Config{BaseURL: s.URL, ClientID: "uji", ClientSecret: "rahasia"})
@@ -403,5 +439,91 @@ func TestParseWebhook(t *testing.T) {
 	}
 	if _, err := ParseWebhook(rahasia, ts, "palsu", muatan); err == nil {
 		t.Fatal("tanda tangan palsu seharusnya ditolak")
+	}
+}
+
+func TestReauthOnUnauthorized(t *testing.T) {
+	s, j := serverTolakSekali(t, "OTP_UNAUTHORIZED_APP", "token_invalid", false)
+	c := newTestClient(t, s)
+
+	if _, err := c.Verify(context.Background(), "otp_UJI", "418293", "LOGIN"); err != nil {
+		t.Fatalf("Verify seharusnya berhasil setelah token diambil ulang: %v", err)
+	}
+	if n := atomic.LoadInt32(&j.token); n != 2 {
+		t.Fatalf("token diambil %d kali, seharusnya 2", n)
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if n := j.count["/v1/otp/verify"]; n != 2 {
+		t.Fatalf("verify dipanggil %d kali, seharusnya 2", n)
+	}
+}
+
+func TestReauthHappensAtMostOnce(t *testing.T) {
+	s, j := serverTolakSekali(t, "OTP_UNAUTHORIZED_APP", "token_invalid", true)
+	c := newTestClient(t, s)
+
+	if _, err := c.Verify(context.Background(), "otp_UJI", "418293", "LOGIN"); err == nil {
+		t.Fatal("penolakan terus-menerus seharusnya tetap menghasilkan error")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if n := j.count["/v1/otp/verify"]; n != 2 {
+		t.Fatalf("verify dipanggil %d kali, seharusnya berhenti di 2", n)
+	}
+}
+
+func TestCodeMismatchDoesNotTriggerReauth(t *testing.T) {
+	// OTP_CODE_MISMATCH juga berstatus 401. Mengulanginya berarti memakan satu
+	// jatah percobaan verifikasi milik pengguna untuk setiap kode yang salah.
+	s, j := serverTolakSekali(t, "OTP_CODE_MISMATCH", "", true)
+	c := newTestClient(t, s)
+
+	if _, err := c.Verify(context.Background(), "otp_UJI", "000000", "LOGIN"); err == nil {
+		t.Fatal("kode salah seharusnya menghasilkan error")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if n := j.count["/v1/otp/verify"]; n != 1 {
+		t.Fatalf("verify dipanggil %d kali — kode salah TIDAK boleh diulang", n)
+	}
+	if n := atomic.LoadInt32(&j.token); n != 1 {
+		t.Fatalf("token diambil %d kali, seharusnya 1", n)
+	}
+}
+
+func TestScopeMissingDoesNotTriggerReauth(t *testing.T) {
+	// Token baru tidak akan memberi scope yang memang tidak dimiliki.
+	s, j := serverTolakSekali(t, "OTP_UNAUTHORIZED_APP", "scope_missing", true)
+	c := newTestClient(t, s)
+
+	if _, err := c.Verify(context.Background(), "otp_UJI", "418293", "LOGIN"); err == nil {
+		t.Fatal("scope kurang seharusnya menghasilkan error")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if n := j.count["/v1/otp/verify"]; n != 1 {
+		t.Fatalf("verify dipanggil %d kali, seharusnya 1", n)
+	}
+}
+
+func TestRetriedRequestCarriesFullBody(t *testing.T) {
+	// Body sudah habis terbaca pada percobaan pertama. Bila tidak disusun
+	// ulang, percobaan kedua terkirim dengan body kosong dan gagal 400 —
+	// kegagalan yang penyebabnya sama sekali tidak terlihat dari pesannya.
+	s, j := serverTolakSekali(t, "OTP_UNAUTHORIZED_APP", "token_invalid", false)
+	c := newTestClient(t, s)
+
+	if _, err := c.Verify(context.Background(), "otp_UJI", "418293", "LOGIN"); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var in map[string]any
+	if err := json.Unmarshal([]byte(j.body["/v1/otp/verify"]), &in); err != nil {
+		t.Fatalf("body percobaan kedua tidak dapat diurai: %v", err)
+	}
+	if in["code"] != "418293" || in["transactionId"] != "otp_UJI" {
+		t.Fatalf("body percobaan kedua tidak lengkap: %v", in)
 	}
 }

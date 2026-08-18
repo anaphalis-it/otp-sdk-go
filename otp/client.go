@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,10 @@ type Error struct {
 	HTTPStatus int
 	RequestID  string
 	Details    map[string]any
+
+	// Token yang dipakai saat request ini ditolak. Dipakai internal agar
+	// pembuangan cache hanya mengenai token yang benar-benar ditolak.
+	tokenDipakai string
 }
 
 func (e *Error) Error() string {
@@ -313,7 +318,62 @@ func (c *Client) Status(ctx context.Context, transactionID string) (*StatusResul
 	return &out, nil
 }
 
+// invalidateToken membuang token yang di-cache, tetapi HANYA bila isinya masih
+// token yang baru saja ditolak. Tanpa perbandingan itu, goroutine yang kebetulan
+// terlambat akan membuang token baru yang baru saja diambil goroutine lain, dan
+// keduanya saling membatalkan tanpa henti.
+func (c *Client) invalidateToken(used string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token == used {
+		c.token = ""
+		c.expiresAt = time.Time{}
+	}
+}
+
+// perluReauth menentukan apakah sebuah error layak dicoba ulang dengan token
+// baru.
+//
+// Pembatasan ke OTP_UNAUTHORIZED_APP bukan kehati-hatian berlebihan.
+// OTP_CODE_MISMATCH juga berstatus 401, dan mengulang request itu berarti
+// memakan satu jatah percobaan verifikasi milik pengguna untuk setiap kode
+// yang salah — kuota habis dua kali lebih cepat tanpa ada yang menyadarinya.
+//
+// scope_missing juga dikecualikan: token baru tidak akan memberi scope yang
+// memang tidak dimiliki credential-nya, sehingga percobaan ulang pasti gagal
+// dengan cara yang sama.
+func perluReauth(e *Error) bool {
+	if e.HTTPStatus != http.StatusUnauthorized || e.Code != "OTP_UNAUTHORIZED_APP" {
+		return false
+	}
+	alasan, _ := e.Details["reason"].(string)
+	return alasan != "scope_missing"
+}
+
+// do mengirim satu request, dan mengulanginya SATU kali dengan token baru bila
+// yang menolak adalah lapisan authentication.
+//
+// Pengulangan ini tidak melanggar prinsip "tidak retry diam-diam". Request yang
+// ditolak di lapisan authentication belum pernah menyentuh logic bisnis, jadi
+// mengulanginya tidak dapat mengirim pesan dua kali maupun menimbulkan biaya
+// ganda. Yang dihindari prinsip itu adalah mengulang request yang mungkin sudah
+// berhasil sebagian.
 func (c *Client) do(ctx context.Context, method, path string, body any,
+	header map[string]string, out any, skipAuth bool) error {
+
+	err := c.attempt(ctx, method, path, body, header, out, skipAuth)
+	if skipAuth || err == nil {
+		return err
+	}
+	var oe *Error
+	if !errors.As(err, &oe) || !perluReauth(oe) {
+		return err
+	}
+	c.invalidateToken(oe.tokenDipakai)
+	return c.attempt(ctx, method, path, body, header, out, skipAuth)
+}
+
+func (c *Client) attempt(ctx context.Context, method, path string, body any,
 	header map[string]string, out any, skipAuth bool) error {
 
 	var reader io.Reader
@@ -342,11 +402,13 @@ func (c *Client) do(ctx context.Context, method, path string, body any,
 	for k, v := range header {
 		req.Header.Set(k, v)
 	}
+	var tokenDipakai string
 	if !skipAuth {
 		tok, err := c.Token(ctx)
 		if err != nil {
 			return err
 		}
+		tokenDipakai = tok
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
@@ -384,7 +446,8 @@ func (c *Client) do(ctx context.Context, method, path string, body any,
 			details = map[string]any{}
 		}
 		return &Error{Code: code, Message: message, HTTPStatus: res.StatusCode,
-			RequestID: envelope.Error.RequestID, Details: details}
+			RequestID: envelope.Error.RequestID, Details: details,
+			tokenDipakai: tokenDipakai}
 	}
 
 	if out != nil && len(raw) > 0 {
