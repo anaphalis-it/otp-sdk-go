@@ -7,7 +7,7 @@ library — tidak ada dependensi pihak ketiga. Membutuhkan Go 1.21 atau lebih
 baru.
 
 ```bash
-go get github.com/anaphalis-it/otp-sdk-go@v1.2.0
+go get github.com/anaphalis-it/otp-sdk-go@v1.2.1
 ```
 
 ## Penggunaan
@@ -131,6 +131,23 @@ pernah match. Ini kesalahan integrasi yang paling sering terjadi.
 tidak dijamin. Pakai `e.Key()` — gabungan `transactionId`, `status`, dan
 `attemptNo`.
 
+Ketiganya diperlukan, bukan hanya `transactionId`. Failover **tidak** membuat
+transaksi baru: percobaan pengganti memakai `transactionId` dan kode OTP yang
+sama, hanya `attemptNo` dan `channel`-nya yang berubah. Satu transaksi karena
+itu dapat menghasilkan beberapa event:
+
+```
+transactionId  status     channel   attemptNo
+otp_4XGJ…      SENT       WHATSAPP  1
+otp_4XGJ…      FAILED     WHATSAPP  1     ← tidak sampai
+otp_4XGJ…      SENT       SMS       2     ← failover, kode SAMA
+otp_4XGJ…      DELIVERED  SMS       2
+```
+
+Bila `transactionId` dipakai sendirian sebagai kunci, event SMS akan dianggap
+duplikat event WhatsApp lalu dibuang — dan aplikasi tidak pernah tahu kodenya
+akhirnya sampai lewat channel lain.
+
 **Balas cepat, proses di background.** Kalau response ditahan sampai proses
 selesai, request-nya timeout dan platform akan retry padahal event-nya sudah
 diterima.
@@ -172,6 +189,10 @@ meloloskan tepat kesalahan yang ingin ditangkap. Tidak ada koneksi keluar.
 Lulus `go vet`, `gofmt`, dan `go test -race`.
 
 ## Riwayat versi
+
+**v1.2.1** — Hanya dokumentasi. README menjelaskan bahwa failover memakai
+`transactionId` yang sama, sehingga kunci idempotensi webhook wajib menyertakan
+`attemptNo`. Tidak ada perubahan kode.
 
 **v1.2.0** — Token yang ditolak di tengah masa berlakunya memicu pengambilan
 token baru dan pengulangan request satu kali, terbatas pada penolakan di
